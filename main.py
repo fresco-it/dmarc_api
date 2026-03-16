@@ -8,7 +8,7 @@ import gzip
 import io
 from typing import Dict, Any, List
 
-appDMARC = FastAPI()
+appdmarc = FastAPI()
 
 KNOWN_IPS = {
     "2a01:111:f403:c201::6",
