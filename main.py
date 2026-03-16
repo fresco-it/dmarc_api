@@ -1,13 +1,14 @@
 from fastapi import FastAPI, Request
 import os
-import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
 import json
 import base64
+import gzip
+import io
 from typing import Dict, Any, List
 
-app = FastAPI()
+appDMARC = FastAPI()
 
 KNOWN_IPS = {
     "2a01:111:f403:c201::6",
@@ -28,12 +29,72 @@ HIGH_FAIL_THRESHOLD = 20
 
 @app.get("/")
 def root():
-    return {"message": "API DMARC ZIP en funcionamiento"}
+    return {"message": "API DMARC en funcionamiento"}
 
 
 def text_or_empty(node, path: str) -> str:
     found = node.find(path)
     return found.text.strip() if found is not None and found.text else ""
+
+
+def normalize_file_bytes(raw: bytes) -> bytes:
+    # Caso 1: ZIP real
+    if raw[:2] == b"PK":
+        return raw
+
+    # Caso 2: GZIP real
+    if raw[:2] == b"\x1f\x8b":
+        return raw
+
+    # Caso 3: XML directo
+    stripped = raw.lstrip()
+    if stripped.startswith(b"<"):
+        return raw
+
+    # Caso 4: base64 como texto
+    try:
+        text = raw.decode("utf-8").strip()
+        decoded = base64.b64decode(text, validate=False)
+        if decoded[:2] in (b"PK", b"\x1f\x8b") or decoded.lstrip().startswith(b"<"):
+            return decoded
+    except Exception:
+        pass
+
+    # Caso 5: JSON con $content
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+        if isinstance(obj, dict) and "$content" in obj:
+            decoded = base64.b64decode(obj["$content"])
+            if decoded[:2] in (b"PK", b"\x1f\x8b") or decoded.lstrip().startswith(b"<"):
+                return decoded
+    except Exception:
+        pass
+
+    raise ValueError("No se ha podido interpretar el body como ZIP, GZIP o XML válido.")
+
+
+def extract_xml_bytes(file_bytes: bytes) -> bytes:
+    # ZIP
+    if file_bytes[:2] == b"PK":
+        with zipfile.ZipFile(io.BytesIO(file_bytes), "r") as z:
+            xml_names = [n for n in z.namelist() if n.lower().endswith(".xml")]
+            if not xml_names:
+                raise ValueError("El ZIP no contiene ningún XML DMARC.")
+            with z.open(xml_names[0]) as f:
+                return f.read()
+
+    # GZIP
+    if file_bytes[:2] == b"\x1f\x8b":
+        xml_bytes = gzip.decompress(file_bytes)
+        if not xml_bytes.lstrip().startswith(b"<"):
+            raise ValueError("El GZIP no contiene un XML válido.")
+        return xml_bytes
+
+    # XML directo
+    if file_bytes.lstrip().startswith(b"<"):
+        return file_bytes
+
+    raise ValueError("Formato no soportado: no es ZIP, GZIP ni XML.")
 
 
 def parse_dmarc_xml(xml_bytes: bytes) -> Dict[str, Any]:
@@ -79,7 +140,6 @@ def parse_dmarc_xml(xml_bytes: bytes) -> Dict[str, Any]:
                     "domain": text_or_empty(s, "domain"),
                     "result": text_or_empty(s, "result")
                 })
-                
 
         result["records"].append({
             "source_ip": source_ip,
@@ -114,7 +174,6 @@ def classify_report(report: Dict[str, Any]) -> Dict[str, Any]:
         trusted_dkim = any(d in TRUSTED_DKIM_DOMAINS for d in dkim_domains)
         trusted_spf = any(s in TRUSTED_SPF_DOMAINS for s in spf_domains)
 
-        # Solo marcar incidencia real si FALLAN SPF y DKIM
         if not dkim_ok and not spf_ok:
             sev = "CRITICAL" if count >= HIGH_FAIL_THRESHOLD else "WARNING"
             issues.append({
@@ -128,8 +187,6 @@ def classify_report(report: Dict[str, Any]) -> Dict[str, Any]:
             })
             continue
 
-        # Si la IP no es conocida pero la autenticación pasa con dominios confiables,
-        # guardamos observación, pero NO warning.
         if not known_ip:
             if trusted_dkim or trusted_spf:
                 observations.append({
@@ -173,67 +230,29 @@ def classify_report(report: Dict[str, Any]) -> Dict[str, Any]:
         "observations": observations
     }
 
-def normalize_zip_bytes(raw: bytes) -> bytes:
-    # Caso 1: ya es un ZIP real
-    if raw[:2] == b"PK":
-        return raw
 
-    # Caso 2: viene como texto base64
-    try:
-        text = raw.decode("utf-8").strip()
-        if text.startswith("UEs"):
-            decoded = base64.b64decode(text)
-            if decoded[:2] == b"PK":
-                return decoded
-    except Exception:
-        pass
-
-    # Caso 3: viene como JSON con $content
-    try:
-        obj = json.loads(raw.decode("utf-8"))
-        if isinstance(obj, dict) and "$content" in obj:
-            decoded = base64.b64decode(obj["$content"])
-            if decoded[:2] == b"PK":
-                return decoded
-    except Exception:
-        pass
-
-    raise ValueError("No se ha podido interpretar el body como ZIP válido.")
-
-
-@app.post("/check-dmarc-zip")
-async def check_dmarc_zip(request: Request):
+@app.post("/check-dmarc")
+async def check_dmarc(request: Request):
     raw = await request.body()
 
     try:
-        zip_bytes = normalize_zip_bytes(raw)
+        file_bytes = normalize_file_bytes(raw)
+        xml_bytes = extract_xml_bytes(file_bytes)
     except Exception as e:
         preview = raw[:200].decode("utf-8", errors="ignore")
         return {
             "status": "ERROR",
-            "summary": f"El contenido recibido no parece un ZIP válido: {str(e)}",
+            "summary": f"No se ha podido interpretar el fichero DMARC: {str(e)}",
             "preview": preview
         }
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
-        tmp.write(zip_bytes)
-        tmp_path = tmp.name
-
     try:
-        with zipfile.ZipFile(tmp_path, "r") as z:
-            xml_names = [n for n in z.namelist() if n.lower().endswith(".xml")]
-            if not xml_names:
-                return {
-                    "status": "ERROR",
-                    "summary": "El ZIP no contiene ningún XML DMARC."
-                }
-
-            with z.open(xml_names[0]) as xml_file:
-                xml_bytes = xml_file.read()
-
         report = parse_dmarc_xml(xml_bytes)
         return classify_report(report)
-
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    except Exception as e:
+        preview = xml_bytes[:200].decode("utf-8", errors="ignore")
+        return {
+            "status": "ERROR",
+            "summary": f"Se ha producido un error al procesar el XML DMARC: {str(e)}",
+            "preview": preview
+        }
